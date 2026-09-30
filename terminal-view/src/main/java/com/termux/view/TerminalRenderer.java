@@ -1,9 +1,14 @@
 package com.termux.view;
 
+import android.graphics.Bitmap;
+import android.graphics.BitmapFactory;
 import android.graphics.Canvas;
 import android.graphics.Paint;
 import android.graphics.PorterDuff;
+import android.graphics.Rect;
+import android.graphics.RectF;
 import android.graphics.Typeface;
+import android.os.Build;
 
 import com.termux.terminal.TerminalBuffer;
 import com.termux.terminal.TerminalEmulator;
@@ -53,6 +58,62 @@ public final class TerminalRenderer {
         }
     }
 
+    // ===== Custom background image =====
+    private static final String BG_PATH = "/data/data/com.termux/files/home/.termux/background.jpg";
+    /** Dark layer over the image so text stays readable. 0x00 = no dimming, 0xFF = fully black. */
+    private static final int BG_DIM_COLOR = 0x99000000;
+
+    private final Paint mBgPaint = new Paint(Paint.FILTER_BITMAP_FLAG);
+    private Bitmap mBgBitmap;
+    private long mBgModified = -1;
+    private long mBgLastCheck = 0;
+    private int mBgW, mBgH;
+
+    private Bitmap getBackgroundBitmap(int w, int h) {
+        if (w <= 0 || h <= 0) return null;
+        long now = System.currentTimeMillis();
+        if (mBgBitmap != null && w == mBgW && h == mBgH && now - mBgLastCheck < 1000) return mBgBitmap;
+        mBgLastCheck = now;
+
+        java.io.File f = new java.io.File(BG_PATH);
+        if (!f.isFile()) {
+            mBgBitmap = null;
+            mBgModified = -1;
+            return null;
+        }
+        long modified = f.lastModified();
+        if (mBgBitmap != null && modified == mBgModified && w == mBgW && h == mBgH) return mBgBitmap;
+
+        try {
+            BitmapFactory.Options bounds = new BitmapFactory.Options();
+            bounds.inJustDecodeBounds = true;
+            BitmapFactory.decodeFile(f.getPath(), bounds);
+            if (bounds.outWidth <= 0 || bounds.outHeight <= 0) { mBgBitmap = null; return null; }
+
+            BitmapFactory.Options opts = new BitmapFactory.Options();
+            int sample = 1;
+            while (bounds.outWidth / (sample * 2) >= w && bounds.outHeight / (sample * 2) >= h) sample *= 2;
+            opts.inSampleSize = sample;
+            Bitmap src = BitmapFactory.decodeFile(f.getPath(), opts);
+            if (src == null) { mBgBitmap = null; return null; }
+
+            // Center-crop to the view's aspect ratio, then scale to the view size.
+            float scale = Math.max((float) w / src.getWidth(), (float) h / src.getHeight());
+            int cropW = Math.min(src.getWidth(), Math.round(w / scale));
+            int cropH = Math.min(src.getHeight(), Math.round(h / scale));
+            int cropX = (src.getWidth() - cropW) / 2;
+            int cropY = (src.getHeight() - cropH) / 2;
+            Bitmap cropped = Bitmap.createBitmap(src, cropX, cropY, cropW, cropH);
+            mBgBitmap = Bitmap.createScaledBitmap(cropped, w, h, true);
+            mBgModified = modified;
+            mBgW = w;
+            mBgH = h;
+        } catch (Throwable t) {
+            mBgBitmap = null;
+        }
+        return mBgBitmap;
+    }
+
     /** Render the terminal to a canvas with at a specified row scroll, and an optional rectangular selection. */
     public final void render(TerminalEmulator mEmulator, Canvas canvas, int topRow,
                              int selectionY1, int selectionY2, int selectionX1, int selectionX2) {
@@ -65,6 +126,13 @@ public final class TerminalRenderer {
         final TerminalBuffer screen = mEmulator.getScreen();
         final int[] palette = mEmulator.mColors.mCurrentColors;
         final int cursorShape = mEmulator.getCursorStyle();
+
+        // Custom background image (~/.termux/background.jpg), drawn under the text.
+        final Bitmap bg = getBackgroundBitmap(canvas.getWidth(), canvas.getHeight());
+        if (bg != null) {
+            canvas.drawBitmap(bg, 0, 0, mBgPaint);
+            canvas.drawColor(BG_DIM_COLOR);
+        }
 
         if (reverseVideo)
             canvas.drawColor(palette[TextStyle.COLOR_INDEX_FOREGROUND], PorterDuff.Mode.SRC);
@@ -98,10 +166,29 @@ public final class TerminalRenderer {
                 final boolean charIsHighsurrogate = Character.isHighSurrogate(charAtIndex);
                 final int charsForCodePoint = charIsHighsurrogate ? 2 : 1;
                 final int codePoint = charIsHighsurrogate ? Character.toCodePoint(charAtIndex, line[currentCharIndex + 1]) : charAtIndex;
+                final long style = lineObject.getStyle(column);
+                if (TextStyle.isTerminalBitmap(style)) {
+                    Bitmap bitmap = mEmulator.getScreen().getSixelBitmap(style);
+                    if (bitmap != null) {
+                        float left = column * mFontWidth;
+                        float top = heightOffset - mFontLineSpacing;
+                        Rect bitmapSrcRect = mEmulator.getScreen().getSixelRect(style);
+                        RectF bitmapDestRect = new RectF(left, top, left + mFontWidth, top + mFontLineSpacing);
+                        canvas.drawBitmap(bitmap, bitmapSrcRect, bitmapDestRect, null);
+                    }
+                    column += 1;
+                    measuredWidthForRun = 0.f;
+                    lastRunStyle = 0;
+                    lastRunInsideCursor = false;
+                    lastRunStartColumn = column + 1;
+                    lastRunStartIndex = currentCharIndex;
+                    lastRunFontWidthMismatch = false;
+                    currentCharIndex += charsForCodePoint;
+                    continue;
+                }
                 final int codePointWcWidth = WcWidth.width(codePoint);
                 final boolean insideCursor = (cursorX == column || (codePointWcWidth == 2 && cursorX == column + 1));
                 final boolean insideSelection = column >= selx1 && column <= selx2;
-                final long style = lineObject.getStyle(column);
 
                 // Check if the measured text width for this code point is not the same as that expected by wcwidth().
                 // This could happen for some fonts which are not truly monospace, or for more exotic characters such as
@@ -112,7 +199,7 @@ public final class TerminalRenderer {
                 final boolean fontWidthMismatch = Math.abs(measuredCodePointWidth / mFontWidth - codePointWcWidth) > 0.01;
 
                 if (style != lastRunStyle || insideCursor != lastRunInsideCursor || insideSelection != lastRunInsideSelection || fontWidthMismatch || lastRunFontWidthMismatch) {
-                    if (column == 0) {
+                    if (column == 0 || column == lastRunStartColumn) {
                         // Skip first column as there is nothing to draw, just record the current style.
                     } else {
                         final int columnWidthSinceLastRun = column - lastRunStartColumn;
@@ -208,8 +295,8 @@ public final class TerminalRenderer {
         if (cursor != 0) {
             mTextPaint.setColor(cursor);
             float cursorHeight = mFontLineSpacingAndAscent - mFontAscent;
-            if (cursorStyle == TerminalEmulator.TERMINAL_CURSOR_STYLE_UNDERLINE) cursorHeight /= 4.;
-            else if (cursorStyle == TerminalEmulator.TERMINAL_CURSOR_STYLE_BAR) right -= ((right - left) * 3) / 4.;
+            if (cursorStyle == TerminalEmulator.TERMINAL_CURSOR_STYLE_UNDERLINE) cursorHeight /= 4.f;
+            else if (cursorStyle == TerminalEmulator.TERMINAL_CURSOR_STYLE_BAR) right -= (((right - left) * 3) / 4.f);
             canvas.drawRect(left, y - cursorHeight, right, y, mTextPaint);
         }
 
@@ -233,7 +320,11 @@ public final class TerminalRenderer {
             mTextPaint.setColor(foreColor);
 
             // The text alignment is the default Paint.Align.LEFT.
-            canvas.drawTextRun(text, startCharIndex, runWidthChars, startCharIndex, runWidthChars, left, y - mFontLineSpacingAndAscent, false, mTextPaint);
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
+                canvas.drawTextRun(text, startCharIndex, runWidthChars, startCharIndex, runWidthChars, left, y - mFontLineSpacingAndAscent, false, mTextPaint);
+            } else {
+                canvas.drawText(text, startCharIndex, runWidthChars, left, y - mFontLineSpacingAndAscent, mTextPaint);
+            }
         }
 
         if (savedMatrix) canvas.restore();
