@@ -1,6 +1,7 @@
 package com.termux.view;
 
 import android.graphics.Bitmap;
+import android.graphics.BitmapFactory;
 import android.graphics.Canvas;
 import android.graphics.Paint;
 import android.graphics.PorterDuff;
@@ -57,6 +58,62 @@ public final class TerminalRenderer {
         }
     }
 
+    // ===== Custom background image =====
+    private static final String BG_PATH = "/data/data/com.termux/files/home/.termux/background.jpg";
+    /** Dark layer over the image so text stays readable. 0x00 = no dimming, 0xFF = fully black. */
+    private static final int BG_DIM_COLOR = 0x99000000;
+
+    private final Paint mBgPaint = new Paint(Paint.FILTER_BITMAP_FLAG);
+    private Bitmap mBgBitmap;
+    private long mBgModified = -1;
+    private long mBgLastCheck = 0;
+    private int mBgW, mBgH;
+
+    private Bitmap getBackgroundBitmap(int w, int h) {
+        if (w <= 0 || h <= 0) return null;
+        long now = System.currentTimeMillis();
+        if (mBgBitmap != null && w == mBgW && h == mBgH && now - mBgLastCheck < 1000) return mBgBitmap;
+        mBgLastCheck = now;
+
+        java.io.File f = new java.io.File(BG_PATH);
+        if (!f.isFile()) {
+            mBgBitmap = null;
+            mBgModified = -1;
+            return null;
+        }
+        long modified = f.lastModified();
+        if (mBgBitmap != null && modified == mBgModified && w == mBgW && h == mBgH) return mBgBitmap;
+
+        try {
+            BitmapFactory.Options bounds = new BitmapFactory.Options();
+            bounds.inJustDecodeBounds = true;
+            BitmapFactory.decodeFile(f.getPath(), bounds);
+            if (bounds.outWidth <= 0 || bounds.outHeight <= 0) { mBgBitmap = null; return null; }
+
+            BitmapFactory.Options opts = new BitmapFactory.Options();
+            int sample = 1;
+            while (bounds.outWidth / (sample * 2) >= w && bounds.outHeight / (sample * 2) >= h) sample *= 2;
+            opts.inSampleSize = sample;
+            Bitmap src = BitmapFactory.decodeFile(f.getPath(), opts);
+            if (src == null) { mBgBitmap = null; return null; }
+
+            // Center-crop to the view's aspect ratio, then scale to the view size.
+            float scale = Math.max((float) w / src.getWidth(), (float) h / src.getHeight());
+            int cropW = Math.min(src.getWidth(), Math.round(w / scale));
+            int cropH = Math.min(src.getHeight(), Math.round(h / scale));
+            int cropX = (src.getWidth() - cropW) / 2;
+            int cropY = (src.getHeight() - cropH) / 2;
+            Bitmap cropped = Bitmap.createBitmap(src, cropX, cropY, cropW, cropH);
+            mBgBitmap = Bitmap.createScaledBitmap(cropped, w, h, true);
+            mBgModified = modified;
+            mBgW = w;
+            mBgH = h;
+        } catch (Throwable t) {
+            mBgBitmap = null;
+        }
+        return mBgBitmap;
+    }
+
     /** Render the terminal to a canvas with at a specified row scroll, and an optional rectangular selection. */
     public final void render(TerminalEmulator mEmulator, Canvas canvas, int topRow,
                              int selectionY1, int selectionY2, int selectionX1, int selectionX2) {
@@ -69,6 +126,13 @@ public final class TerminalRenderer {
         final TerminalBuffer screen = mEmulator.getScreen();
         final int[] palette = mEmulator.mColors.mCurrentColors;
         final int cursorShape = mEmulator.getCursorStyle();
+
+        // Custom background image (~/.termux/background.jpg), drawn under the text.
+        final Bitmap bg = getBackgroundBitmap(canvas.getWidth(), canvas.getHeight());
+        if (bg != null) {
+            canvas.drawBitmap(bg, 0, 0, mBgPaint);
+            canvas.drawColor(BG_DIM_COLOR);
+        }
 
         if (reverseVideo)
             canvas.drawColor(palette[TextStyle.COLOR_INDEX_FOREGROUND], PorterDuff.Mode.SRC);
